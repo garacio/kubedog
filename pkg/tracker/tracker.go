@@ -43,6 +43,7 @@ type Options struct {
 	ParentContext context.Context
 	Timeout       time.Duration
 	LogsFromTime  time.Time
+	DisableEvents bool
 }
 
 type ResourceError struct {

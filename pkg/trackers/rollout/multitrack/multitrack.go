@@ -72,11 +72,18 @@ type MultitrackSpec struct {
 	//ShowLogsUntil             DeployCondition TODO
 
 	ShowServiceMessages bool
+	DisableEvents       bool
 }
 
 type MultitrackOptions struct {
 	tracker.Options
 	StatusProgressPeriod time.Duration
+}
+
+func ToTrackerOptions(spec MultitrackSpec, multitrackOpts MultitrackOptions) tracker.Options {
+	opts := multitrackOpts.Options
+	opts.DisableEvents = spec.DisableEvents
+	return opts
 }
 
 func newMultitrackOptions(parentContext context.Context, timeout, statusProgessPeriod time.Duration, logsFromTime time.Time) MultitrackOptions {

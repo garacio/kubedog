@@ -84,6 +84,8 @@ func (mt *multitracker) TrackDeployment(kube kubernetes.Interface, spec Multitra
 		return nil
 	})
 
+	trackOpts := opts.Options
+	trackOpts.DisableEvents = spec.DisableEvents
 	return feed.Track(spec.ResourceName, spec.Namespace, kube, opts.Options)
 }
 
