@@ -235,6 +235,7 @@ func (mt *multitracker) displayStatusProgress() error {
 			mt.displayDaemonSetsStatusProgress()
 			mt.displayStatefulSetsStatusProgress()
 			mt.displayJobsProgress()
+			mt.displayPodsProgress()
 		})
 
 	logboek.Context(context.Background()).LogOptionalLn()
@@ -295,6 +296,50 @@ func (mt *multitracker) displayJobsProgress() {
 		}
 
 		mt.PrevJobsStatuses[name] = status
+	}
+
+	if len(resourcesNames) > 0 {
+		logboek.Context(context.Background()).Log(t.Render())
+	}
+}
+
+func (mt *multitracker) displayPodsProgress() {
+	t := utils.NewTable(statusProgressTableRatio...)
+	t.SetWidth(logboek.Context(context.Background()).Streams().ContentWidth() - 1)
+	t.Header("POD", "READY", "RESTARTS", "STATUS")
+
+	resourcesNames := []string{}
+	for name := range mt.PodsSpecs {
+		resourcesNames = append(resourcesNames, name)
+	}
+	sort.Strings(resourcesNames)
+
+	for _, name := range resourcesNames {
+		prevStatus := mt.PrevPodsStatuses[name]
+		status := mt.PodsStatuses[name]
+
+		spec := mt.PodsSpecs[name]
+
+		showProgress := status.StatusGeneration > prevStatus.StatusGeneration
+		disableWarningColors := spec.FailMode == IgnoreAndContinueDeployProcess
+
+		resource := formatResourceCaption(name, spec.FailMode, status.IsSucceeded, status.IsFailed, true)
+
+		succeeded := "-"
+		if status.StatusIndicator != nil {
+			succeeded = status.StatusIndicator.FormatTableElem(prevStatus.StatusIndicator, indicators.FormatTableElemOptions{
+				ShowProgress:         showProgress,
+				DisableWarningColors: disableWarningColors,
+			})
+		}
+
+		if status.IsFailed {
+			t.Row(resource, status.IsReady, status.Restarts, strings.Join([]string{succeeded}, "/"), formatResourceError(disableWarningColors, status.FailedReason))
+		} else {
+			t.Row(resource, status.IsReady, status.Restarts, strings.Join([]string{succeeded}, "/"))
+		}
+
+		mt.PrevPodsStatuses[name] = status
 	}
 
 	if len(resourcesNames) > 0 {

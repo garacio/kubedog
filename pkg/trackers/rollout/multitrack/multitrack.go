@@ -18,6 +18,7 @@ import (
 	"github.com/werf/kubedog/pkg/tracker/debug"
 	"github.com/werf/kubedog/pkg/tracker/deployment"
 	"github.com/werf/kubedog/pkg/tracker/job"
+	"github.com/werf/kubedog/pkg/tracker/pod"
 	"github.com/werf/kubedog/pkg/tracker/statefulset"
 )
 
@@ -51,6 +52,7 @@ type MultitrackSpecs struct {
 	StatefulSets []MultitrackSpec
 	DaemonSets   []MultitrackSpec
 	Jobs         []MultitrackSpec
+	Pods         []MultitrackSpec
 }
 
 type MultitrackSpec struct {
@@ -110,7 +112,7 @@ func setDefaultSpecValues(spec *MultitrackSpec) {
 }
 
 func Multitrack(kube kubernetes.Interface, specs MultitrackSpecs, opts MultitrackOptions) error {
-	if len(specs.Deployments)+len(specs.StatefulSets)+len(specs.DaemonSets)+len(specs.Jobs) == 0 {
+	if len(specs.Deployments)+len(specs.StatefulSets)+len(specs.DaemonSets)+len(specs.Jobs)+len(specs.Pods) == 0 {
 		return nil
 	}
 
@@ -125,6 +127,9 @@ func Multitrack(kube kubernetes.Interface, specs MultitrackSpecs, opts Multitrac
 	}
 	for i := range specs.Jobs {
 		setDefaultSpecValues(&specs.Jobs[i])
+	}
+	for i := range specs.Pods {
+		setDefaultSpecValues(&specs.Pods[i])
 	}
 
 	mt := multitracker{
@@ -151,6 +156,12 @@ func Multitrack(kube kubernetes.Interface, specs MultitrackSpecs, opts Multitrac
 		TrackingJobs:     make(map[string]*multitrackerResourceState),
 		JobsStatuses:     make(map[string]job.JobStatus),
 		PrevJobsStatuses: make(map[string]job.JobStatus),
+
+		PodsSpecs:        make(map[string]MultitrackSpec),
+		PodsContexts:     make(map[string]*multitrackerContext),
+		TrackingPods:     make(map[string]*multitrackerResourceState),
+		PodsStatuses:     make(map[string]pod.PodStatus),
+		PrevPodsStatuses: make(map[string]pod.PodStatus),
 
 		serviceMessagesByResource: make(map[string][]string),
 	}
@@ -258,6 +269,18 @@ func (mt *multitracker) Start(kube kubernetes.Interface, specs MultitrackSpecs, 
 		})
 	}
 
+	for _, spec := range specs.Pods {
+		mt.PodsContexts[spec.ResourceName] = newMultitrackerContext(opts.ParentContext)
+		mt.PodsSpecs[spec.ResourceName] = spec
+		mt.TrackingPods[spec.ResourceName] = newMultitrackerResourceState(spec)
+
+		wg.Add(1)
+
+		go mt.runSpecTracker("pod", spec, mt.PodsContexts[spec.ResourceName], &wg, mt.PodsContexts, doneChan, errorChan, func(spec MultitrackSpec, mtCtx *multitrackerContext) error {
+			return mt.TrackPod(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime))
+		})
+	}
+
 	if err := mt.applyTrackTerminationMode(); err != nil {
 		errorChan <- fmt.Errorf("unable to apply termination mode: %s", err)
 		return
@@ -349,6 +372,13 @@ func (mt *multitracker) applyTrackTerminationMode() error {
 		debugMsg = append(debugMsg, fmt.Sprintf("will stop context for job %q", name))
 		contextsToStop = append(contextsToStop, ctx)
 	}
+	for name, ctx := range mt.PodsContexts {
+		if shouldContinueTracking(name, mt.PodsSpecs[name]) {
+			return nil
+		}
+		debugMsg = append(debugMsg, fmt.Sprintf("will stop context for pod %q", name))
+		contextsToStop = append(contextsToStop, ctx)
+	}
 
 	mt.isTerminating = true
 
@@ -419,6 +449,12 @@ type multitracker struct {
 	JobsStatuses     map[string]job.JobStatus
 	PrevJobsStatuses map[string]job.JobStatus
 
+	PodsSpecs        map[string]MultitrackSpec
+	PodsContexts     map[string]*multitrackerContext
+	TrackingPods     map[string]*multitrackerResourceState
+	PodsStatuses     map[string]pod.PodStatus
+	PrevPodsStatuses map[string]pod.PodStatus
+
 	mux sync.Mutex
 
 	isFailed      bool
@@ -470,6 +506,7 @@ func (mt *multitracker) hasFailedTrackingResources() bool {
 		mt.TrackingStatefulSets,
 		mt.TrackingDaemonSets,
 		mt.TrackingJobs,
+		mt.TrackingPods,
 	} {
 		for _, state := range states {
 			if state.Status == resourceFailed {
@@ -506,6 +543,12 @@ func (mt *multitracker) formatFailedTrackingResourcesError() error {
 			continue
 		}
 		msgParts = append(msgParts, fmt.Sprintf("job/%s failed: %s", name, state.FailedReason))
+	}
+	for name, state := range mt.TrackingPods {
+		if state.Status != resourceFailed {
+			continue
+		}
+		msgParts = append(msgParts, fmt.Sprintf("pod/%s failed: %s", name, state.FailedReason))
 	}
 
 	return fmt.Errorf("%s", strings.Join(msgParts, "\n"))
@@ -610,6 +653,11 @@ func (mt *multitracker) getActiveResourcesNames() []string {
 	for name, state := range mt.TrackingJobs {
 		if state.Status == resourceActive {
 			activeResources = append(activeResources, fmt.Sprintf("job/%s", name))
+		}
+	}
+	for name, state := range mt.TrackingPods {
+		if state.Status == resourceActive {
+			activeResources = append(activeResources, fmt.Sprintf("pod/%s", name))
 		}
 	}
 
