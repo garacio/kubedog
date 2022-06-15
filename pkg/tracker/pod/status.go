@@ -3,10 +3,10 @@ package pod
 import (
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/werf/kubedog/pkg/tracker/indicators"
 	"github.com/werf/kubedog/pkg/utils"
-
-	corev1 "k8s.io/api/core/v1"
 )
 
 type PodStatus struct {
@@ -25,7 +25,7 @@ type PodStatus struct {
 	IsSucceeded  bool
 	FailedReason string
 
-	ContainersErrors map[string]string
+	ContainersErrors []ContainerError
 }
 
 func NewPodStatus(pod *corev1.Pod, statusGeneration uint64, trackedContainers []string, isTrackerFailed bool, trackerFailedReason string) PodStatus {
@@ -87,17 +87,18 @@ func NewPodStatus(pod *corev1.Pod, statusGeneration uint64, trackedContainers []
 			container := pod.Status.ContainerStatuses[i]
 
 			restarts += container.RestartCount
-			if container.State.Waiting != nil && container.State.Waiting.Reason != "" {
+			switch {
+			case container.State.Waiting != nil && container.State.Waiting.Reason != "":
 				reason = container.State.Waiting.Reason
-			} else if container.State.Terminated != nil && container.State.Terminated.Reason != "" {
+			case container.State.Terminated != nil && container.State.Terminated.Reason != "":
 				reason = container.State.Terminated.Reason
-			} else if container.State.Terminated != nil && container.State.Terminated.Reason == "" {
+			case container.State.Terminated != nil && container.State.Terminated.Reason == "":
 				if container.State.Terminated.Signal != 0 {
 					reason = fmt.Sprintf("Signal:%d", container.State.Terminated.Signal)
 				} else {
 					reason = fmt.Sprintf("ExitCode:%d", container.State.Terminated.ExitCode)
 				}
-			} else if container.Ready && container.State.Running != nil {
+			case container.Ready && container.State.Running != nil:
 				hasRunning = true
 				readyContainers++
 			}
@@ -142,22 +143,21 @@ func NewPodStatus(pod *corev1.Pod, statusGeneration uint64, trackedContainers []
 
 func setContainersStatusesToPodStatus(status *PodStatus, pod *corev1.Pod) {
 	allContainerStatuses := make([]corev1.ContainerStatus, 0)
-	for _, cs := range pod.Status.InitContainerStatuses {
-		allContainerStatuses = append(allContainerStatuses, cs)
-	}
-	for _, cs := range pod.Status.ContainerStatuses {
-		allContainerStatuses = append(allContainerStatuses, cs)
-	}
+	allContainerStatuses = append(allContainerStatuses, pod.Status.InitContainerStatuses...)
+	allContainerStatuses = append(allContainerStatuses, pod.Status.ContainerStatuses...)
 
 	for _, cs := range allContainerStatuses {
 		if cs.State.Waiting != nil {
 			switch cs.State.Waiting.Reason {
 			case "ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff", "ErrImageNeverPull":
 				if status.ContainersErrors == nil {
-					status.ContainersErrors = make(map[string]string)
+					status.ContainersErrors = []ContainerError{}
 				}
 
-				status.ContainersErrors[cs.Name] = fmt.Sprintf("%s: %s", cs.State.Waiting.Reason, cs.State.Waiting.Message)
+				status.ContainersErrors = append(status.ContainersErrors, ContainerError{
+					ContainerName: cs.Name,
+					Message:       fmt.Sprintf("%s: %s", cs.State.Waiting.Reason, cs.State.Waiting.Message),
+				})
 			}
 		}
 	}

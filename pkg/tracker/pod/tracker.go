@@ -78,19 +78,26 @@ type Tracker struct {
 	TrackedContainers []string
 	LogsFromTime      time.Time
 
+	readinessProbes                          map[string]*ReadinessProbe
+	ignoreReadinessProbeFailsByContainerName map[string]time.Duration
+
 	lastObject   *corev1.Pod
 	failedReason string
 
 	objectAdded    chan *corev1.Pod
 	objectModified chan *corev1.Pod
 	objectDeleted  chan *corev1.Pod
-	objectFailed   chan string
+	objectFailed   chan interface{}
 
 	containerDone chan string
 	errors        chan error
 }
 
-func NewTracker(name, namespace string, kube kubernetes.Interface) *Tracker {
+type Options struct {
+	IgnoreReadinessProbeFailsByContainerName map[string]time.Duration
+}
+
+func NewTracker(name, namespace string, kube kubernetes.Interface, opts Options) *Tracker {
 	return &Tracker{
 		Tracker: tracker.Tracker{
 			Kube:             kube,
@@ -100,14 +107,14 @@ func NewTracker(name, namespace string, kube kubernetes.Interface) *Tracker {
 		},
 
 		Added:     make(chan PodStatus, 1),
-		Deleted:   make(chan PodStatus, 0),
-		Succeeded: make(chan PodStatus, 0),
-		Ready:     make(chan PodStatus, 0),
-		Failed:    make(chan FailedReport, 0),
+		Deleted:   make(chan PodStatus),
+		Succeeded: make(chan PodStatus),
+		Ready:     make(chan PodStatus),
+		Failed:    make(chan FailedReport),
 		Status:    make(chan PodStatus, 100),
 
 		EventMsg:          make(chan string, 1),
-		ContainerError:    make(chan ContainerErrorReport, 0),
+		ContainerError:    make(chan ContainerErrorReport),
 		ContainerLogChunk: make(chan *ContainerLogChunk, 1000),
 
 		State:                        tracker.Initial,
@@ -115,11 +122,14 @@ func NewTracker(name, namespace string, kube kubernetes.Interface) *Tracker {
 		ContainerTrackerStateChanges: make(map[string]chan tracker.TrackerState),
 		LogsFromTime:                 time.Time{},
 
-		objectAdded:    make(chan *corev1.Pod, 0),
-		objectModified: make(chan *corev1.Pod, 0),
-		objectDeleted:  make(chan *corev1.Pod, 0),
-		objectFailed:   make(chan string, 1),
-		errors:         make(chan error, 0),
+		readinessProbes:                          make(map[string]*ReadinessProbe),
+		ignoreReadinessProbeFailsByContainerName: opts.IgnoreReadinessProbeFailsByContainerName,
+
+		objectAdded:    make(chan *corev1.Pod),
+		objectModified: make(chan *corev1.Pod),
+		objectDeleted:  make(chan *corev1.Pod),
+		objectFailed:   make(chan interface{}, 1),
+		errors:         make(chan error),
 		containerDone:  make(chan string, 10),
 	}
 }
@@ -172,20 +182,17 @@ func (pod *Tracker) Start(ctx context.Context) error {
 
 			pod.Deleted <- status
 
-		case reason := <-pod.objectFailed:
-			pod.State = tracker.ResourceFailed
-			pod.failedReason = reason
-
-			var status PodStatus
-			if pod.lastObject != nil {
-				pod.StatusGeneration++
-				status = NewPodStatus(pod.lastObject, pod.StatusGeneration, pod.TrackedContainers, pod.State == tracker.ResourceFailed, pod.failedReason)
-			} else {
-				status = PodStatus{IsFailed: true, FailedReason: reason}
+		case failure := <-pod.objectFailed:
+			switch failure := failure.(type) {
+			case string:
+				pod.handleRegularFailure(failure)
+			case event.ProbeTriggeredRestart:
+				pod.handleProbeTriggeredRestart(failure)
+			case event.ReadinessProbeFailure:
+				pod.handleReadinessProbeFailure(failure)
+			default:
+				panic(fmt.Errorf("unexpected type %T", failure))
 			}
-
-			pod.LastStatus = status
-			pod.Failed <- FailedReport{PodStatus: status, FailedReason: reason}
 
 		case containerName := <-pod.containerDone:
 			trackedContainers := make([]string, 0)
@@ -221,6 +228,65 @@ func (pod *Tracker) Start(ctx context.Context) error {
 	}
 }
 
+func (pod *Tracker) handleRegularFailure(reason string) {
+	pod.State = tracker.ResourceFailed
+	pod.failedReason = reason
+
+	var status PodStatus
+	if pod.lastObject != nil {
+		pod.StatusGeneration++
+		status = NewPodStatus(pod.lastObject, pod.StatusGeneration, pod.TrackedContainers, pod.State == tracker.ResourceFailed, pod.failedReason)
+	} else {
+		status = PodStatus{IsFailed: true, FailedReason: reason}
+	}
+
+	pod.LastStatus = status
+	pod.Failed <- FailedReport{PodStatus: status, FailedReason: reason}
+}
+
+func (pod *Tracker) handleProbeTriggeredRestart(event event.ProbeTriggeredRestart) {
+	if debug.Debug() {
+		fmt.Printf("Container %q of pod %q processing ProbeTriggeredRestart event\n",
+			pod.ResourceName, event.ContainerName)
+	}
+	pod.ContainerError <- ContainerErrorReport{
+		ContainerError: ContainerError{
+			ContainerName: event.ContainerName,
+			Message:       event.Message,
+		},
+		PodStatus: pod.LastStatus,
+	}
+}
+
+func (pod *Tracker) handleReadinessProbeFailure(event event.ReadinessProbeFailure) {
+	readinessProbe, ok := pod.readinessProbes[event.ContainerName]
+	if !ok {
+		fmt.Printf("WARNING: Container %q of pod %q has no ReadinessProbe initialized, but ReadinessProbeFailure received: %s\n",
+			pod.ResourceName, event.ContainerName, event.Message)
+		return
+	}
+
+	if readinessProbe.IsFailureShouldBeIgnoredNow() {
+		if debug.Debug() {
+			fmt.Printf("Container %q of pod %q ignores ReadinessProbeFailure: %s\n",
+				pod.ResourceName, event.ContainerName, event.Message)
+		}
+		return
+	}
+
+	if debug.Debug() {
+		fmt.Printf("Container %q of pod %q processing ReadinessProbeFailure: %s\n",
+			pod.ResourceName, event.ContainerName, event.Message)
+	}
+	pod.ContainerError <- ContainerErrorReport{
+		ContainerError: ContainerError{
+			ContainerName: event.ContainerName,
+			Message:       event.Message,
+		},
+		PodStatus: pod.LastStatus,
+	}
+}
+
 func (pod *Tracker) handlePodState(ctx context.Context, object *corev1.Pod) error {
 	pod.lastObject = object
 	pod.StatusGeneration++
@@ -231,23 +297,28 @@ func (pod *Tracker) handlePodState(ctx context.Context, object *corev1.Pod) erro
 	switch pod.State {
 	case tracker.Initial:
 		if os.Getenv("KUBEDOG_DISABLE_EVENTS") != "1" {
+			pod.setupReadinessProbes()
 			pod.runEventsInformer(ctx)
 		}
 
 		if err := pod.runContainersTrackers(ctx, object); err != nil {
-			return fmt.Errorf("unable to start tracking pod/%s containers: %s", pod.ResourceName, err)
+			return fmt.Errorf("unable to start tracking pod/%s containers: %w", pod.ResourceName, err)
+		}
+	default:
+		if os.Getenv("KUBEDOG_DISABLE_EVENTS") != "1" {
+			pod.updateReadinessProbes()
 		}
 	}
 
 	if err := pod.handleContainersState(object); err != nil {
-		return fmt.Errorf("unable to handle pod containers state: %s", err)
+		return fmt.Errorf("unable to handle pod containers state: %w", err)
 	}
 
-	for containerName, msg := range status.ContainersErrors {
+	for _, containerError := range status.ContainersErrors {
 		pod.ContainerError <- ContainerErrorReport{
 			ContainerError: ContainerError{
-				ContainerName: containerName,
-				Message:       msg,
+				ContainerName: containerError.ContainerName,
+				Message:       containerError.Message,
 			},
 			PodStatus: status,
 		}
@@ -255,55 +326,59 @@ func (pod *Tracker) handlePodState(ctx context.Context, object *corev1.Pod) erro
 
 	switch pod.State {
 	case tracker.Initial:
-		if status.IsFailed {
+		switch {
+		case status.IsFailed:
 			pod.State = tracker.ResourceFailed
 			pod.Failed <- FailedReport{PodStatus: status, FailedReason: status.FailedReason}
-		} else if status.IsSucceeded {
+		case status.IsSucceeded:
 			pod.State = tracker.ResourceSucceeded
 			pod.Succeeded <- status
-		} else if status.IsReady {
+		case status.IsReady:
 			pod.State = tracker.ResourceReady
 			pod.Ready <- status
-		} else {
+		default:
 			pod.State = tracker.ResourceAdded
 			pod.Added <- status
 		}
 	case tracker.ResourceAdded, tracker.ResourceFailed:
-		if status.IsFailed {
+		switch {
+		case status.IsFailed:
 			pod.State = tracker.ResourceFailed
 			pod.Failed <- FailedReport{PodStatus: status, FailedReason: status.FailedReason}
-		} else if status.IsSucceeded {
+		case status.IsSucceeded:
 			pod.State = tracker.ResourceSucceeded
 			pod.Succeeded <- status
-		} else if status.IsReady {
+		case status.IsReady:
 			pod.State = tracker.ResourceReady
 			pod.Ready <- status
-		} else {
+		default:
 			pod.Status <- status
 		}
 	case tracker.ResourceSucceeded:
 		pod.Status <- status
 	case tracker.ResourceReady:
-		if status.IsFailed {
+		switch {
+		case status.IsFailed:
 			pod.State = tracker.ResourceFailed
 			pod.Failed <- FailedReport{PodStatus: status, FailedReason: status.FailedReason}
-		} else if status.IsSucceeded {
+		case status.IsSucceeded:
 			pod.State = tracker.ResourceSucceeded
 			pod.Succeeded <- status
-		} else {
+		default:
 			pod.Status <- status
 		}
 	case tracker.ResourceDeleted:
-		if status.IsFailed {
+		switch {
+		case status.IsFailed:
 			pod.State = tracker.ResourceFailed
 			pod.Failed <- FailedReport{PodStatus: status, FailedReason: status.FailedReason}
-		} else if status.IsSucceeded {
+		case status.IsSucceeded:
 			pod.State = tracker.ResourceSucceeded
 			pod.Succeeded <- status
-		} else if status.IsReady {
+		case status.IsReady:
 			pod.State = tracker.ResourceReady
 			pod.Ready <- status
-		} else {
+		default:
 			pod.State = tracker.ResourceAdded
 			pod.Added <- status
 		}
@@ -314,12 +389,8 @@ func (pod *Tracker) handlePodState(ctx context.Context, object *corev1.Pod) erro
 
 func (pod *Tracker) handleContainersState(object *corev1.Pod) error {
 	allContainerStatuses := make([]corev1.ContainerStatus, 0)
-	for _, cs := range object.Status.InitContainerStatuses {
-		allContainerStatuses = append(allContainerStatuses, cs)
-	}
-	for _, cs := range object.Status.ContainerStatuses {
-		allContainerStatuses = append(allContainerStatuses, cs)
-	}
+	allContainerStatuses = append(allContainerStatuses, object.Status.InitContainerStatuses...)
+	allContainerStatuses = append(allContainerStatuses, object.Status.ContainerStatuses...)
 
 	for _, cs := range allContainerStatuses {
 		if cs.State.Running != nil || cs.State.Terminated != nil {
@@ -466,7 +537,8 @@ func (pod *Tracker) runContainersTrackers(ctx context.Context, object *corev1.Po
 
 		pod.TrackedContainers = append(pod.TrackedContainers, containerName)
 
-		newCtx, _ := context.WithCancel(ctx)
+		newCtx, newCtxCancel := context.WithCancel(ctx)
+		_ = newCtxCancel
 
 		go func(ctx context.Context) {
 			if debug.Debug() {
@@ -518,21 +590,22 @@ func (pod *Tracker) runInformer(ctx context.Context) error {
 				}
 			}
 
-			if e.Type == watch.Added {
+			switch e.Type {
+			case watch.Added:
 				pod.objectAdded <- object
-			} else if e.Type == watch.Modified {
+			case watch.Modified:
 				pod.objectModified <- object
-			} else if e.Type == watch.Deleted {
+			case watch.Deleted:
 				pod.objectDeleted <- object
-			} else if e.Type == watch.Error {
-				pod.errors <- fmt.Errorf("Pod %s error: %v", pod.ResourceName, e.Object)
+			case watch.Error:
+				pod.errors <- fmt.Errorf("pod %s error: %v", pod.ResourceName, e.Object)
 			}
 
 			return false, nil
 		})
 
 		if err := tracker.AdaptInformerError(err); err != nil {
-			pod.errors <- fmt.Errorf("pod/%s informer error: %s", pod.ResourceName, err)
+			pod.errors <- fmt.Errorf("pod/%s informer error: %w", pod.ResourceName, err)
 		}
 
 		if debug.Debug() {
@@ -548,4 +621,50 @@ func (pod *Tracker) runEventsInformer(ctx context.Context) {
 	eventInformer := event.NewEventInformer(&pod.Tracker, pod.lastObject)
 	eventInformer.WithChannels(pod.EventMsg, pod.objectFailed, pod.errors)
 	eventInformer.Run(ctx)
+}
+
+func (pod *Tracker) setupReadinessProbes() {
+	for _, container := range pod.lastObject.Spec.Containers {
+		if container.ReadinessProbe == nil || pod.readinessProbes[container.Name] != nil {
+			continue
+		}
+
+		var ignoreReadinessProbeFailsByContainerName *time.Duration
+		if ignore, ok := pod.ignoreReadinessProbeFailsByContainerName[container.Name]; ok {
+			ignoreReadinessProbeFailsByContainerName = &ignore
+		}
+
+		var isStarted *bool
+		for _, cs := range pod.LastStatus.ContainerStatuses {
+			if cs.Name == container.Name {
+				isStarted = cs.Started
+				break
+			}
+		}
+
+		readinessProbe := NewReadinessProbe(container.ReadinessProbe, container.StartupProbe, isStarted, ignoreReadinessProbeFailsByContainerName)
+		pod.readinessProbes[container.Name] = &readinessProbe
+	}
+}
+
+func (pod *Tracker) updateReadinessProbes() {
+	for _, container := range pod.lastObject.Spec.Containers {
+		if container.ReadinessProbe == nil {
+			continue
+		}
+
+		var isStarted *bool
+		for _, cs := range pod.LastStatus.ContainerStatuses {
+			if cs.Name == container.Name {
+				isStarted = cs.Started
+				break
+			}
+		}
+
+		readinessProbe, ok := pod.readinessProbes[container.Name]
+		if !ok {
+			panic("readinessProbe can't be unset while trying to update")
+		}
+		readinessProbe.SetupStartedAtTime(isStarted)
+	}
 }

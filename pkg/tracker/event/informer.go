@@ -3,6 +3,7 @@ package event
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -11,7 +12,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
-
 	watchtools "k8s.io/client-go/tools/watch"
 
 	"github.com/werf/kubedog/pkg/tracker"
@@ -19,11 +19,21 @@ import (
 	"github.com/werf/kubedog/pkg/utils"
 )
 
+type ProbeTriggeredRestart struct {
+	ContainerName string
+	Message       string
+}
+
+type ReadinessProbeFailure struct {
+	ContainerName string
+	Message       string
+}
+
 type EventInformer struct {
 	tracker.Tracker
 	Resource interface{}
 	Messages chan string
-	Failures chan string
+	Failures chan interface{}
 	Errors   chan error
 
 	initialEventUids map[types.UID]bool
@@ -41,19 +51,19 @@ func NewEventInformer(trk *tracker.Tracker, resource interface{}) *EventInformer
 			FullResourceName: trk.FullResourceName,
 		},
 		Resource:         resource,
-		Errors:           make(chan error, 0),
-		initialEventUids: make(map[types.UID]bool, 0),
+		Errors:           make(chan error),
+		initialEventUids: make(map[types.UID]bool),
 	}
 }
 
-func (e *EventInformer) WithChannels(msgCh chan string, failCh chan string, errors chan error) *EventInformer {
+func (e *EventInformer) WithChannels(msgCh chan string, failCh chan interface{}, errors chan error) *EventInformer {
 	e.Messages = msgCh
 	e.Failures = failCh
 	e.Errors = errors
 	return e
 }
 
-// runEventsInformer watch for StatefulSet events
+// Run watch for StatefulSet events
 func (e *EventInformer) Run(ctx context.Context) {
 	e.handleInitialEvents(ctx)
 
@@ -95,18 +105,18 @@ func (e *EventInformer) Run(ctx context.Context) {
 			switch ev.Type {
 			case watch.Added:
 				e.handleEvent(object)
-				//if debug.Debug() {
+				// if debug.Debug() {
 				//	fmt.Printf("> Event: %#v\n", object)
-				//}
+				// }
 			case watch.Modified:
 				e.handleEvent(object)
-				//if debug.Debug() {
+				// if debug.Debug() {
 				//	fmt.Printf("> Event: %#v\n", object)
-				//}
+				// }
 			case watch.Deleted:
-				//if debug.Debug() {
+				// if debug.Debug() {
 				//	fmt.Printf("> Event: %#v\n", object)
-				//}
+				// }
 			case watch.Error:
 				return true, fmt.Errorf("event watch error: %v", ev.Object)
 			}
@@ -115,15 +125,13 @@ func (e *EventInformer) Run(ctx context.Context) {
 		})
 
 		if err := tracker.AdaptInformerError(err); err != nil {
-			e.Errors <- fmt.Errorf("event informer for %s failed: %s", e.FullResourceName, err)
+			e.Errors <- fmt.Errorf("event informer for %s failed: %w", e.FullResourceName, err)
 		}
 
 		if debug.Debug() {
 			fmt.Printf("     %s event informer DONE\n", e.FullResourceName)
 		}
 	}()
-
-	return
 }
 
 // handleInitialEvents saves uids of existed k8s events to ignore watch.Added events on them
@@ -147,27 +155,57 @@ func (e *EventInformer) handleInitialEvents(ctx context.Context) {
 // handleEvent sends a message to Messages channel for all events and a message to Failures channel for Failed events
 func (e *EventInformer) handleEvent(event *corev1.Event) {
 	uid := event.UID
+	msg := fmt.Sprintf("%s: %s", event.Reason, event.Message)
 
 	if _, ok := e.initialEventUids[uid]; ok {
 		if debug.Debug() {
-			fmt.Printf("IGNORE initial event %s %s\n", event.Reason, event.Message)
+			fmt.Printf("IGNORE initial event: %s\n", msg)
 		}
 		delete(e.initialEventUids, uid)
 		return
 	}
 
-	reason := event.Reason
-
 	if debug.Debug() {
-		fmt.Printf("  %s got normal event: %s %s\n", e.FullResourceName, event.Reason, event.Message)
+		fmt.Printf("  %s got normal event: %s\n", e.FullResourceName, msg)
 	}
 
-	e.Messages <- fmt.Sprintf("%s: %s", reason, event.Message)
+	e.Messages <- msg
 
-	if strings.Contains(reason, "Failed") {
+	switch resource := e.Resource.(type) {
+	case *corev1.Pod:
+		e.handlePodEvent(event, resource, msg)
+	default:
+		e.handleRegularEvent(event, msg)
+	}
+}
+
+func (e *EventInformer) handleRegularEvent(event *corev1.Event, msg string) {
+	if strings.Contains(event.Reason, "Failed") {
 		if debug.Debug() {
-			fmt.Printf("got FAILED EVENT!!! %s %s\n", event.Reason, event.Message)
+			fmt.Printf("got FAILED EVENT!!! %s\n", msg)
 		}
-		e.Failures <- fmt.Sprintf("%s: %s", reason, event.Message)
+		e.Failures <- msg
+	}
+}
+
+func (e *EventInformer) handlePodEvent(event *corev1.Event, pod *corev1.Pod, msg string) {
+	if pod.ObjectMeta.DeletionTimestamp != nil {
+		return
+	}
+
+	if matched, err := regexp.MatchString(`failed (startup|liveness) probe, will be restarted`, event.Message); err != nil {
+		panic("can't compile regex")
+	} else if matched {
+		e.Failures <- ProbeTriggeredRestart{
+			ContainerName: strings.TrimSuffix(strings.Split(event.InvolvedObject.FieldPath, "{")[1], "}"),
+			Message:       msg,
+		}
+	}
+
+	if strings.Contains(event.Message, "Readiness probe failed:") {
+		e.Failures <- ReadinessProbeFailure{
+			ContainerName: strings.TrimSuffix(strings.Split(event.InvolvedObject.FieldPath, "{")[1], "}"),
+			Message:       msg,
+		}
 	}
 }

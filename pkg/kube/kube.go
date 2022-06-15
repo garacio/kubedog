@@ -4,19 +4,20 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-
-	// load auth plugins
 	_ "k8s.io/client-go/plugin/pkg/client/auth/azure"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/exec"
-	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp" // only required to authenticate against GKE clusters
+	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/openstack"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/werf/kubedog/pkg/utils"
 )
@@ -27,10 +28,11 @@ const (
 )
 
 var (
-	Kubernetes, Client kubernetes.Interface
-	DynamicClient      dynamic.Interface
-	DefaultNamespace   string
-	Context            string
+	Kubernetes       kubernetes.Interface
+	Client           kubernetes.Interface
+	DynamicClient    dynamic.Interface
+	DefaultNamespace string
+	Context          string
 )
 
 type InitOptions struct {
@@ -62,9 +64,10 @@ func Init(opts InitOptions) error {
 }
 
 type KubeConfigOptions struct {
-	Context          string
-	ConfigPath       string
-	ConfigDataBase64 string
+	Context             string
+	ConfigPath          string
+	ConfigDataBase64    string
+	ConfigPathMergeList []string
 }
 
 type KubeConfig struct {
@@ -75,7 +78,7 @@ type KubeConfig struct {
 
 func GetKubeConfig(opts KubeConfigOptions) (*KubeConfig, error) {
 	// Try to load from kubeconfig in flags or from ~/.kube/config
-	config, outOfClusterErr := getOutOfClusterConfig(opts.Context, opts.ConfigPath, opts.ConfigDataBase64)
+	config, outOfClusterErr := getOutOfClusterConfig(opts.Context, opts.ConfigPath, opts.ConfigDataBase64, opts.ConfigPathMergeList)
 
 	if config == nil {
 		if hasInClusterConfig() {
@@ -83,7 +86,7 @@ func GetKubeConfig(opts KubeConfigOptions) (*KubeConfig, error) {
 			if config, err := getInClusterConfig(); err != nil {
 				if opts.ConfigPath != "" || opts.Context != "" || opts.ConfigDataBase64 != "" {
 					if outOfClusterErr != nil {
-						return nil, fmt.Errorf("out-of-cluster config error: %v, in-cluster config error: %v", outOfClusterErr, err)
+						return nil, fmt.Errorf("out-of-cluster config error: %w, in-cluster config error: %w", outOfClusterErr, err)
 					}
 				} else {
 					return nil, err
@@ -105,7 +108,9 @@ func GetKubeConfig(opts KubeConfigOptions) (*KubeConfig, error) {
 }
 
 type GetAllContextsClientsOptions struct {
-	KubeConfig string
+	ConfigPath          string
+	ConfigDataBase64    string
+	ConfigPathMergeList []string
 }
 
 type ContextClient struct {
@@ -117,11 +122,12 @@ type ContextClient struct {
 func GetAllContextsClients(opts GetAllContextsClientsOptions) ([]*ContextClient, error) {
 	// Try to load contexts from kubeconfig in flags or from ~/.kube/config
 	var outOfClusterErr error
-	contexts, outOfClusterErr := getOutOfClusterContextsClients(opts.KubeConfig)
+	contexts, outOfClusterErr := getOutOfClusterContextsClients(opts.ConfigPath, opts.ConfigDataBase64, opts.ConfigPathMergeList)
 	// return if contexts are loaded successfully
-	if contexts != nil {
+	if len(contexts) > 0 {
 		return contexts, nil
 	}
+
 	if hasInClusterConfig() {
 		contextClient, err := getInClusterContextClient()
 		if err != nil {
@@ -139,7 +145,7 @@ func GetAllContextsClients(opts GetAllContextsClientsOptions) ([]*ContextClient,
 }
 
 func makeOutOfClusterClientConfigError(configPath, context string, err error) error {
-	baseErrMsg := fmt.Sprintf("out-of-cluster configuration problem")
+	baseErrMsg := "out-of-cluster configuration problem"
 
 	if configPath != "" {
 		baseErrMsg += fmt.Sprintf(", custom kube config path is %q", configPath)
@@ -149,20 +155,35 @@ func makeOutOfClusterClientConfigError(configPath, context string, err error) er
 		baseErrMsg += fmt.Sprintf(", custom kube context is %q", context)
 	}
 
-	return fmt.Errorf("%s: %s", baseErrMsg, err)
+	return fmt.Errorf("%s: %w", baseErrMsg, err)
 }
 
-func GetClientConfig(context string, configPath string, configData []byte) (clientcmd.ClientConfig, error) {
+func setConfigPathMergeListEnvironment(configPathMergeList []string) error {
+	configPathEnvVar := strings.Join(configPathMergeList, string(filepath.ListSeparator))
+	if err := os.Setenv(clientcmd.RecommendedConfigPathEnvVar, configPathEnvVar); err != nil {
+		return fmt.Errorf("unable to set env var %q: %w", clientcmd.RecommendedConfigPathEnvVar, err)
+	}
+	return nil
+}
+
+func GetClientConfig(context string, configPath string, configData []byte, configPathMergeList []string) (clientcmd.ClientConfig, error) {
 	overrides := &clientcmd.ConfigOverrides{ClusterDefaults: clientcmd.ClusterDefaults}
 	if context != "" {
 		overrides.CurrentContext = context
 	}
 
 	if configData != nil {
-		if config, err := clientcmd.Load(configData); err != nil {
-			return nil, fmt.Errorf("unable to load config data: %s", err)
-		} else {
-			return clientcmd.NewDefaultClientConfig(*config, overrides), nil
+		config, err := clientcmd.Load(configData)
+		if err != nil {
+			return nil, fmt.Errorf("unable to load config data: %w", err)
+		}
+
+		return clientcmd.NewDefaultClientConfig(*config, overrides), nil
+	}
+
+	if len(configPathMergeList) > 0 {
+		if err := setConfigPathMergeListEnvironment(configPathMergeList); err != nil {
+			return nil, err
 		}
 	}
 
@@ -181,40 +202,51 @@ func hasInClusterConfig() bool {
 	return token && ns
 }
 
-func getOutOfClusterConfig(context, configPath, configDataBase64 string) (*KubeConfig, error) {
-	res := &KubeConfig{}
-
+func parseConfigDataBase64(configDataBase64 string) ([]byte, error) {
 	var configData []byte
+
 	if configDataBase64 != "" {
 		if data, err := base64.StdEncoding.DecodeString(configDataBase64); err != nil {
-			return nil, fmt.Errorf("unable to decode base64 config data: %s", err)
+			return nil, fmt.Errorf("unable to decode base64 config data: %w", err)
 		} else {
 			configData = data
 		}
 	}
 
-	clientConfig, err := GetClientConfig(context, configPath, configData)
+	return configData, nil
+}
+
+func getOutOfClusterConfig(context, configPath, configDataBase64 string, configPathMergeList []string) (*KubeConfig, error) {
+	res := &KubeConfig{}
+
+	configData, err := parseConfigDataBase64(configDataBase64)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse base64 config data: %w", err)
+	}
+
+	clientConfig, err := GetClientConfig(context, configPath, configData, configPathMergeList)
 	if err != nil {
 		return nil, makeOutOfClusterClientConfigError(configPath, context, err)
 	}
 
 	if ns, _, err := clientConfig.Namespace(); err != nil {
-		return nil, fmt.Errorf("cannot determine default kubernetes namespace: %s", err)
+		return nil, fmt.Errorf("cannot determine default kubernetes namespace: %w", err)
 	} else {
 		res.DefaultNamespace = ns
 	}
 
-	if config, err := clientConfig.ClientConfig(); err != nil {
+	config, err := clientConfig.ClientConfig()
+	if err != nil {
 		return nil, makeOutOfClusterClientConfigError(configPath, context, err)
-	} else if config == nil {
-		return nil, nil
-	} else {
-		res.Config = config
 	}
+	if config == nil {
+		return nil, nil
+	}
+	res.Config = config
 
 	if context == "" {
 		if rc, err := clientConfig.RawConfig(); err != nil {
-			return nil, fmt.Errorf("cannot get raw kubernetes config: %s", err)
+			return nil, fmt.Errorf("cannot get raw kubernetes config: %w", err)
 		} else {
 			res.Context = rc.CurrentContext
 		}
@@ -225,10 +257,15 @@ func getOutOfClusterConfig(context, configPath, configDataBase64 string) (*KubeC
 	return res, nil
 }
 
-func getOutOfClusterContextsClients(configPath string) ([]*ContextClient, error) {
-	res := make([]*ContextClient, 0)
+func getOutOfClusterContextsClients(configPath, configDataBase64 string, configPathMergeList []string) ([]*ContextClient, error) {
+	var res []*ContextClient
 
-	clientConfig, err := GetClientConfig("", configPath, nil)
+	configData, err := parseConfigDataBase64(configDataBase64)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse base64 config data: %w", err)
+	}
+
+	clientConfig, err := GetClientConfig("", configPath, configData, configPathMergeList)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +276,7 @@ func getOutOfClusterContextsClients(configPath string) ([]*ContextClient, error)
 	}
 
 	for contextName, context := range rc.Contexts {
-		clientConfig, err := GetClientConfig(contextName, configPath, nil)
+		clientConfig, err := GetClientConfig(contextName, configPath, configData, configPathMergeList)
 		if err != nil {
 			return nil, makeOutOfClusterClientConfigError(configPath, contextName, err)
 		}
@@ -268,13 +305,13 @@ func getInClusterConfig() (*KubeConfig, error) {
 	res := &KubeConfig{}
 
 	if config, err := rest.InClusterConfig(); err != nil {
-		return nil, fmt.Errorf("in-cluster configuration problem: %s", err)
+		return nil, fmt.Errorf("in-cluster configuration problem: %w", err)
 	} else {
 		res.Config = config
 	}
 
 	if data, err := ioutil.ReadFile(kubeNamespaceFilePath); err != nil {
-		return nil, fmt.Errorf("in-cluster configuration problem: cannot determine default kubernetes namespace: error reading %s: %s", kubeNamespaceFilePath, err)
+		return nil, fmt.Errorf("in-cluster configuration problem: cannot determine default kubernetes namespace: error reading %s: %w", kubeNamespaceFilePath, err)
 	} else {
 		res.DefaultNamespace = string(data)
 	}

@@ -11,21 +11,20 @@ import (
 	"github.com/werf/kubedog/pkg/tracker/replicaset"
 )
 
-// TrackDeploymentTillReady
 func TrackDeploymentTillReady(name, namespace string, kube kubernetes.Interface, opts tracker.Options) error {
 	feed := deployment.NewFeed()
 
 	feed.OnAdded(func(isReady bool) error {
 		if isReady {
 			fmt.Fprintf(display.Out, "# deploy/%s appears to be ready\n", name)
-			return tracker.StopTrack
+			return tracker.ErrStopTrack
 		}
 		fmt.Fprintf(display.Out, "# deploy/%s added\n", name)
 		return nil
 	})
 	feed.OnReady(func() error {
 		fmt.Fprintf(display.Out, "# deploy/%s become READY\n", name)
-		return tracker.StopTrack
+		return tracker.ErrStopTrack
 	})
 	feed.OnFailed(func(reason string) error {
 		fmt.Fprintf(display.Out, "# deploy/%s FAIL: %s\n", name, reason)
