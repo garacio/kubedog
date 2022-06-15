@@ -7,13 +7,10 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/wait"
-
 	"k8s.io/client-go/kubernetes"
 )
 
-var (
-	StopTrack = errors.New("stop tracking now")
-)
+var ErrStopTrack = errors.New("stop tracking now")
 
 const (
 	Initial           TrackerState = ""
@@ -40,9 +37,10 @@ type Tracker struct {
 }
 
 type Options struct {
-	ParentContext context.Context
-	Timeout       time.Duration
-	LogsFromTime  time.Time
+	ParentContext                            context.Context
+	Timeout                                  time.Duration
+	LogsFromTime                             time.Time
+	IgnoreReadinessProbeFailsByContainerName map[string]time.Duration
 }
 
 type ResourceError struct {

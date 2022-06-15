@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/werf/logboek/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/werf/logboek/pkg/types"
-
 	"github.com/werf/kubedog/pkg/tracker"
+	"github.com/werf/kubedog/pkg/tracker/canary"
 	"github.com/werf/kubedog/pkg/tracker/daemonset"
 	"github.com/werf/kubedog/pkg/tracker/debug"
 	"github.com/werf/kubedog/pkg/tracker/deployment"
@@ -37,13 +37,13 @@ const (
 	HopeUntilEndOfDeployProcess       FailMode = "HopeUntilEndOfDeployProcess"
 )
 
-//type DeployCondition string
+// type DeployCondition string
 //
-//const (
+// const (
 //	ControllerIsReady DeployCondition = "ControllerIsReady"
 //	PodIsReady        DeployCondition = "PodIsReady"
 //	EndOfDeploy       DeployCondition = "EndOfDeploy"
-//)
+// )
 
 var ErrFailWholeDeployProcessImmediately = errors.New("fail whole deploy process immediately")
 
@@ -52,6 +52,7 @@ type MultitrackSpecs struct {
 	StatefulSets []MultitrackSpec
 	DaemonSets   []MultitrackSpec
 	Jobs         []MultitrackSpec
+	Canaries     []MultitrackSpec
 	Pods         []MultitrackSpec
 }
 
@@ -63,6 +64,8 @@ type MultitrackSpec struct {
 	FailMode                FailMode
 	AllowFailuresCount      *int
 	FailureThresholdSeconds *int
+
+	IgnoreReadinessProbeFailsByContainerName map[string]time.Duration
 
 	LogRegex                *regexp.Regexp
 	LogRegexByContainerName map[string]*regexp.Regexp
@@ -80,15 +83,22 @@ type MultitrackOptions struct {
 	StatusProgressPeriod time.Duration
 }
 
-func newMultitrackOptions(parentContext context.Context, timeout, statusProgessPeriod time.Duration, logsFromTime time.Time) MultitrackOptions {
+func newMultitrackOptions(parentContext context.Context, timeout, statusProgessPeriod time.Duration, logsFromTime time.Time, ignoreReadinessProbeFailsByContainerName map[string]time.Duration) MultitrackOptions {
 	return MultitrackOptions{
 		Options: tracker.Options{
-			ParentContext: parentContext,
-			Timeout:       timeout,
-			LogsFromTime:  logsFromTime,
+			ParentContext:                            parentContext,
+			Timeout:                                  timeout,
+			LogsFromTime:                             logsFromTime,
+			IgnoreReadinessProbeFailsByContainerName: ignoreReadinessProbeFailsByContainerName,
 		},
 		StatusProgressPeriod: statusProgessPeriod,
 	}
+}
+
+func setDefaultCanarySpecValues(spec *MultitrackSpec) {
+	setDefaultSpecValues(spec)
+
+	*spec.AllowFailuresCount = 0
 }
 
 func setDefaultSpecValues(spec *MultitrackSpec) {
@@ -112,7 +122,7 @@ func setDefaultSpecValues(spec *MultitrackSpec) {
 }
 
 func Multitrack(kube kubernetes.Interface, specs MultitrackSpecs, opts MultitrackOptions) error {
-	if len(specs.Deployments)+len(specs.StatefulSets)+len(specs.DaemonSets)+len(specs.Jobs)+len(specs.Pods) == 0 {
+	if len(specs.Deployments)+len(specs.StatefulSets)+len(specs.DaemonSets)+len(specs.Jobs)+len(specs.Canaries)+len(specs.Pods) == 0 {
 		return nil
 	}
 
@@ -127,6 +137,9 @@ func Multitrack(kube kubernetes.Interface, specs MultitrackSpecs, opts Multitrac
 	}
 	for i := range specs.Jobs {
 		setDefaultSpecValues(&specs.Jobs[i])
+	}
+	for i := range specs.Canaries {
+		setDefaultCanarySpecValues(&specs.Canaries[i])
 	}
 	for i := range specs.Pods {
 		setDefaultSpecValues(&specs.Pods[i])
@@ -157,6 +170,12 @@ func Multitrack(kube kubernetes.Interface, specs MultitrackSpecs, opts Multitrac
 		JobsStatuses:     make(map[string]job.JobStatus),
 		PrevJobsStatuses: make(map[string]job.JobStatus),
 
+		CanariesSpecs:        make(map[string]MultitrackSpec),
+		CanariesContexts:     make(map[string]*multitrackerContext),
+		TrackingCanaries:     make(map[string]*multitrackerResourceState),
+		CanariesStatuses:     make(map[string]canary.CanaryStatus),
+		PrevCanariesStatuses: make(map[string]canary.CanaryStatus),
+
 		PodsSpecs:        make(map[string]MultitrackSpec),
 		PodsContexts:     make(map[string]*multitrackerContext),
 		TrackingPods:     make(map[string]*multitrackerResourceState),
@@ -166,8 +185,8 @@ func Multitrack(kube kubernetes.Interface, specs MultitrackSpecs, opts Multitrac
 		serviceMessagesByResource: make(map[string][]string),
 	}
 
-	errorChan := make(chan error, 0)
-	doneChan := make(chan struct{}, 0)
+	errorChan := make(chan error)
+	doneChan := make(chan struct{})
 
 	var statusProgressChan <-chan time.Time
 
@@ -181,7 +200,7 @@ func Multitrack(kube kubernetes.Interface, specs MultitrackSpecs, opts Multitrac
 		defer statusProgressTicker.Stop()
 		statusProgressChan = statusProgressTicker.C
 	} else {
-		statusProgressChan = make(chan time.Time, 0)
+		statusProgressChan = make(chan time.Time)
 	}
 
 	doDisplayStatusProgress := func() error {
@@ -229,7 +248,7 @@ func (mt *multitracker) Start(kube kubernetes.Interface, specs MultitrackSpecs, 
 		wg.Add(1)
 
 		go mt.runSpecTracker("deploy", spec, mt.DeploymentsContexts[spec.ResourceName], &wg, mt.DeploymentsContexts, doneChan, errorChan, func(spec MultitrackSpec, mtCtx *multitrackerContext) error {
-			return mt.TrackDeployment(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime))
+			return mt.TrackDeployment(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime, spec.IgnoreReadinessProbeFailsByContainerName))
 		})
 	}
 
@@ -241,7 +260,7 @@ func (mt *multitracker) Start(kube kubernetes.Interface, specs MultitrackSpecs, 
 		wg.Add(1)
 
 		go mt.runSpecTracker("sts", spec, mt.StatefulSetsContexts[spec.ResourceName], &wg, mt.StatefulSetsContexts, doneChan, errorChan, func(spec MultitrackSpec, mtCtx *multitrackerContext) error {
-			return mt.TrackStatefulSet(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime))
+			return mt.TrackStatefulSet(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime, spec.IgnoreReadinessProbeFailsByContainerName))
 		})
 	}
 
@@ -253,7 +272,7 @@ func (mt *multitracker) Start(kube kubernetes.Interface, specs MultitrackSpecs, 
 		wg.Add(1)
 
 		go mt.runSpecTracker("ds", spec, mt.DaemonSetsContexts[spec.ResourceName], &wg, mt.DaemonSetsContexts, doneChan, errorChan, func(spec MultitrackSpec, mtCtx *multitrackerContext) error {
-			return mt.TrackDaemonSet(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime))
+			return mt.TrackDaemonSet(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime, spec.IgnoreReadinessProbeFailsByContainerName))
 		})
 	}
 
@@ -265,7 +284,19 @@ func (mt *multitracker) Start(kube kubernetes.Interface, specs MultitrackSpecs, 
 		wg.Add(1)
 
 		go mt.runSpecTracker("job", spec, mt.JobsContexts[spec.ResourceName], &wg, mt.JobsContexts, doneChan, errorChan, func(spec MultitrackSpec, mtCtx *multitrackerContext) error {
-			return mt.TrackJob(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime))
+			return mt.TrackJob(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime, spec.IgnoreReadinessProbeFailsByContainerName))
+		})
+	}
+
+	for _, spec := range specs.Canaries {
+		mt.CanariesContexts[spec.ResourceName] = newMultitrackerContext(opts.ParentContext)
+		mt.CanariesSpecs[spec.ResourceName] = spec
+		mt.TrackingCanaries[spec.ResourceName] = newMultitrackerResourceState(spec)
+
+		wg.Add(1)
+
+		go mt.runSpecTracker("canary", spec, mt.CanariesContexts[spec.ResourceName], &wg, mt.CanariesContexts, doneChan, errorChan, func(spec MultitrackSpec, mtCtx *multitrackerContext) error {
+			return mt.TrackCanary(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime, spec.IgnoreReadinessProbeFailsByContainerName))
 		})
 	}
 
@@ -277,12 +308,12 @@ func (mt *multitracker) Start(kube kubernetes.Interface, specs MultitrackSpecs, 
 		wg.Add(1)
 
 		go mt.runSpecTracker("pod", spec, mt.PodsContexts[spec.ResourceName], &wg, mt.PodsContexts, doneChan, errorChan, func(spec MultitrackSpec, mtCtx *multitrackerContext) error {
-			return mt.TrackPod(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime))
+			return mt.TrackPod(kube, spec, newMultitrackOptions(mtCtx.Context, opts.Timeout, opts.StatusProgressPeriod, opts.LogsFromTime, spec.IgnoreReadinessProbeFailsByContainerName))
 		})
 	}
 
 	if err := mt.applyTrackTerminationMode(); err != nil {
-		errorChan <- fmt.Errorf("unable to apply termination mode: %s", err)
+		errorChan <- fmt.Errorf("unable to apply termination mode: %w", err)
 		return
 	}
 
@@ -372,6 +403,12 @@ func (mt *multitracker) applyTrackTerminationMode() error {
 		debugMsg = append(debugMsg, fmt.Sprintf("will stop context for job %q", name))
 		contextsToStop = append(contextsToStop, ctx)
 	}
+	for name, ctx := range mt.CanariesContexts {
+		if shouldContinueTracking(name, mt.CanariesSpecs[name]) {
+			return nil
+		}
+		contextsToStop = append(contextsToStop, ctx)
+	}
 	for name, ctx := range mt.PodsContexts {
 		if shouldContinueTracking(name, mt.PodsSpecs[name]) {
 			return nil
@@ -412,13 +449,13 @@ func (mt *multitracker) runSpecTracker(kind string, spec MultitrackSpec, mtCtx *
 		return
 	} else if err != nil {
 		// unknown error
-		errorChan <- fmt.Errorf("%s/%s track failed: %s", kind, spec.ResourceName, err)
+		errorChan <- fmt.Errorf("%s/%s track failed: %w", kind, spec.ResourceName, err)
 		mt.isFailed = true
 		return
 	}
 
 	if err := mt.applyTrackTerminationMode(); err != nil {
-		errorChan <- fmt.Errorf("unable to apply termination mode: %s", err)
+		errorChan <- fmt.Errorf("unable to apply termination mode: %w", err)
 		mt.isFailed = true
 		return
 	}
@@ -448,6 +485,12 @@ type multitracker struct {
 	TrackingJobs     map[string]*multitrackerResourceState
 	JobsStatuses     map[string]job.JobStatus
 	PrevJobsStatuses map[string]job.JobStatus
+
+	CanariesSpecs        map[string]MultitrackSpec
+	CanariesContexts     map[string]*multitrackerContext
+	TrackingCanaries     map[string]*multitrackerResourceState
+	CanariesStatuses     map[string]canary.CanaryStatus
+	PrevCanariesStatuses map[string]canary.CanaryStatus
 
 	PodsSpecs        map[string]MultitrackSpec
 	PodsContexts     map[string]*multitrackerContext
@@ -544,6 +587,12 @@ func (mt *multitracker) formatFailedTrackingResourcesError() error {
 		}
 		msgParts = append(msgParts, fmt.Sprintf("job/%s failed: %s", name, state.FailedReason))
 	}
+	for name, state := range mt.TrackingCanaries {
+		if state.Status != resourceFailed {
+			continue
+		}
+		msgParts = append(msgParts, fmt.Sprintf("canary/%s failed: %s", name, state.FailedReason))
+	}
 	for name, state := range mt.TrackingPods {
 		if state.Status != resourceFailed {
 			continue
@@ -556,7 +605,7 @@ func (mt *multitracker) formatFailedTrackingResourcesError() error {
 
 func (mt *multitracker) handleResourceReadyCondition(resourcesStates map[string]*multitrackerResourceState, spec MultitrackSpec) error {
 	resourcesStates[spec.ResourceName].Status = resourceSucceeded
-	return tracker.StopTrack
+	return tracker.ErrStopTrack
 }
 
 func (mt *multitracker) handleResourceFailure(resourcesStates map[string]*multitrackerResourceState, kind string, spec MultitrackSpec, reason string) error {

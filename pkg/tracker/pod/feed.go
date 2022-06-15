@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/werf/kubedog/pkg/tracker"
-	"github.com/werf/kubedog/pkg/tracker/debug"
 	"k8s.io/client-go/kubernetes"
 	watchtools "k8s.io/client-go/tools/watch"
+
+	"github.com/werf/kubedog/pkg/tracker"
+	"github.com/werf/kubedog/pkg/tracker/debug"
 )
 
 type Feed interface {
@@ -47,31 +48,38 @@ type feed struct {
 func (f *feed) OnAdded(function func() error) {
 	f.OnAddedFunc = function
 }
+
 func (f *feed) OnSucceeded(function func() error) {
 	f.OnSucceededFunc = function
 }
+
 func (f *feed) OnFailed(function func(string) error) {
 	f.OnFailedFunc = function
 }
+
 func (f *feed) OnEventMsg(function func(string) error) {
 	f.OnEventMsgFunc = function
 }
+
 func (f *feed) OnReady(function func() error) {
 	f.OnReadyFunc = function
 }
+
 func (f *feed) OnContainerLogChunk(function func(*ContainerLogChunk) error) {
 	f.OnContainerLogChunkFunc = function
 }
+
 func (f *feed) OnContainerError(function func(ContainerError) error) {
 	f.OnContainerErrorFunc = function
 }
+
 func (f *feed) OnStatus(function func(PodStatus) error) {
 	f.OnStatusFunc = function
 }
 
 func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tracker.Options) error {
-	errorChan := make(chan error, 0)
-	doneChan := make(chan struct{}, 0)
+	errorChan := make(chan error)
+	doneChan := make(chan struct{})
 
 	parentContext := opts.ParentContext
 	if parentContext == nil {
@@ -80,7 +88,9 @@ func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tra
 	ctx, cancel := watchtools.ContextWithOptionalTimeout(parentContext, opts.Timeout)
 	defer cancel()
 
-	pod := NewTracker(name, namespace, kube)
+	pod := NewTracker(name, namespace, kube, Options{
+		opts.IgnoreReadinessProbeFailsByContainerName,
+	})
 
 	go func() {
 		err := pod.Start(ctx)
@@ -103,7 +113,7 @@ func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tra
 
 			if f.OnContainerLogChunkFunc != nil {
 				err := f.OnContainerLogChunkFunc(chunk)
-				if err == tracker.StopTrack {
+				if err == tracker.ErrStopTrack {
 					return nil
 				}
 				if err != nil {
@@ -116,7 +126,7 @@ func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tra
 
 			if f.OnContainerErrorFunc != nil {
 				err := f.OnContainerErrorFunc(report.ContainerError)
-				if err == tracker.StopTrack {
+				if err == tracker.ErrStopTrack {
 					return nil
 				}
 				if err != nil {
@@ -129,7 +139,7 @@ func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tra
 
 			if f.OnAddedFunc != nil {
 				err := f.OnAddedFunc()
-				if err == tracker.StopTrack {
+				if err == tracker.ErrStopTrack {
 					return nil
 				}
 				if err != nil {
@@ -142,7 +152,7 @@ func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tra
 
 			if f.OnSucceededFunc != nil {
 				err := f.OnSucceededFunc()
-				if err == tracker.StopTrack {
+				if err == tracker.ErrStopTrack {
 					return nil
 				}
 				if err != nil {
@@ -155,7 +165,7 @@ func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tra
 
 			if f.OnFailedFunc != nil {
 				err := f.OnFailedFunc(failed.FailedReason)
-				if err == tracker.StopTrack {
+				if err == tracker.ErrStopTrack {
 					return nil
 				}
 				if err != nil {
@@ -170,7 +180,7 @@ func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tra
 
 			if f.OnEventMsgFunc != nil {
 				err := f.OnEventMsgFunc(msg)
-				if err == tracker.StopTrack {
+				if err == tracker.ErrStopTrack {
 					return nil
 				}
 				if err != nil {
@@ -183,7 +193,7 @@ func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tra
 
 			if f.OnReadyFunc != nil {
 				err := f.OnReadyFunc()
-				if err == tracker.StopTrack {
+				if err == tracker.ErrStopTrack {
 					return nil
 				}
 				if err != nil {
@@ -196,7 +206,7 @@ func (f *feed) Track(name, namespace string, kube kubernetes.Interface, opts tra
 
 			if f.OnStatusFunc != nil {
 				err := f.OnStatusFunc(status)
-				if err == tracker.StopTrack {
+				if err == tracker.ErrStopTrack {
 					return nil
 				}
 				if err != nil {

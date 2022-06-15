@@ -4,6 +4,17 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	watchtools "k8s.io/client-go/tools/watch"
 
 	"github.com/werf/kubedog/pkg/tracker"
 	"github.com/werf/kubedog/pkg/tracker/debug"
@@ -11,16 +22,6 @@ import (
 	"github.com/werf/kubedog/pkg/tracker/pod"
 	"github.com/werf/kubedog/pkg/tracker/replicaset"
 	"github.com/werf/kubedog/pkg/utils"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/cache"
-
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	watchtools "k8s.io/client-go/tools/watch"
 )
 
 type ReplicaSetAddedReport struct {
@@ -51,6 +52,8 @@ type Tracker struct {
 	podStatuses      map[string]pod.PodStatus
 	rsNameByPod      map[string]string
 
+	ignoreReadinessProbeFailsByContainerName map[string]time.Duration
+
 	TrackedPodsNames []string
 
 	Added  chan DeploymentStatus
@@ -67,7 +70,7 @@ type Tracker struct {
 	resourceAdded      chan *appsv1.Deployment
 	resourceModified   chan *appsv1.Deployment
 	resourceDeleted    chan *appsv1.Deployment
-	resourceFailed     chan string
+	resourceFailed     chan interface{}
 	replicaSetAdded    chan *appsv1.ReplicaSet
 	replicaSetModified chan *appsv1.ReplicaSet
 	replicaSetDeleted  chan *appsv1.ReplicaSet
@@ -91,25 +94,27 @@ func NewTracker(name, namespace string, kube kubernetes.Interface, opts tracker.
 		},
 
 		Added:  make(chan DeploymentStatus, 1),
-		Ready:  make(chan DeploymentStatus, 0),
-		Failed: make(chan DeploymentStatus, 0),
+		Ready:  make(chan DeploymentStatus),
+		Failed: make(chan DeploymentStatus),
 		Status: make(chan DeploymentStatus, 100),
 
 		EventMsg:        make(chan string, 1),
 		AddedReplicaSet: make(chan ReplicaSetAddedReport, 10),
 		AddedPod:        make(chan PodAddedReport, 10),
 		PodLogChunk:     make(chan *replicaset.ReplicaSetPodLogChunk, 1000),
-		PodError:        make(chan PodErrorReport, 0),
+		PodError:        make(chan PodErrorReport),
 
 		knownReplicaSets: make(map[string]*appsv1.ReplicaSet),
 		podStatuses:      make(map[string]pod.PodStatus),
 		rsNameByPod:      make(map[string]string),
 
-		errors:             make(chan error, 0),
+		ignoreReadinessProbeFailsByContainerName: opts.IgnoreReadinessProbeFailsByContainerName,
+
+		errors:             make(chan error),
 		resourceAdded:      make(chan *appsv1.Deployment, 1),
 		resourceModified:   make(chan *appsv1.Deployment, 1),
 		resourceDeleted:    make(chan *appsv1.Deployment, 1),
-		resourceFailed:     make(chan string, 1),
+		resourceFailed:     make(chan interface{}, 1),
 		replicaSetAdded:    make(chan *appsv1.ReplicaSet, 1),
 		replicaSetModified: make(chan *appsv1.ReplicaSet, 1),
 		replicaSetDeleted:  make(chan *appsv1.ReplicaSet, 1),
@@ -153,22 +158,27 @@ func (d *Tracker) Track(ctx context.Context) (err error) {
 			d.TrackedPodsNames = nil
 			d.Status <- DeploymentStatus{}
 
-		case reason := <-d.resourceFailed:
-			d.State = tracker.ResourceFailed
-			d.failedReason = reason
+		case failure := <-d.resourceFailed:
+			switch failure := failure.(type) {
+			case string:
+				d.State = tracker.ResourceFailed
+				d.failedReason = failure
 
-			var status DeploymentStatus
-			if d.lastObject != nil {
-				d.StatusGeneration++
-				newPodsNames, err := d.getNewPodsNames()
-				if err != nil {
-					return err
+				var status DeploymentStatus
+				if d.lastObject != nil {
+					d.StatusGeneration++
+					newPodsNames, err := d.getNewPodsNames()
+					if err != nil {
+						return err
+					}
+					status = NewDeploymentStatus(d.lastObject, d.StatusGeneration, d.State == tracker.ResourceFailed, d.failedReason, d.podStatuses, newPodsNames)
+				} else {
+					status = DeploymentStatus{IsFailed: true, FailedReason: failure}
 				}
-				status = NewDeploymentStatus(d.lastObject, d.StatusGeneration, (d.State == tracker.ResourceFailed), d.failedReason, d.podStatuses, newPodsNames)
-			} else {
-				status = DeploymentStatus{IsFailed: true, FailedReason: reason}
+				d.Failed <- status
+			default:
+				panic(fmt.Errorf("unexpected type %T", failure))
 			}
-			d.Failed <- status
 
 		case rs := <-d.replicaSetAdded:
 			d.knownReplicaSets[rs.Name] = rs
@@ -184,7 +194,7 @@ func (d *Tracker) Track(ctx context.Context) (err error) {
 				if err != nil {
 					return err
 				}
-				status := NewDeploymentStatus(d.lastObject, d.StatusGeneration, (d.State == tracker.ResourceFailed), d.failedReason, d.podStatuses, newPodsNames)
+				status := NewDeploymentStatus(d.lastObject, d.StatusGeneration, d.State == tracker.ResourceFailed, d.failedReason, d.podStatuses, newPodsNames)
 
 				d.AddedReplicaSet <- ReplicaSetAddedReport{
 					ReplicaSet: replicaset.ReplicaSet{
@@ -215,7 +225,7 @@ func (d *Tracker) Track(ctx context.Context) (err error) {
 				if err != nil {
 					return err
 				}
-				status := NewDeploymentStatus(d.lastObject, d.StatusGeneration, (d.State == tracker.ResourceFailed), d.failedReason, d.podStatuses, newPodsNames)
+				status := NewDeploymentStatus(d.lastObject, d.StatusGeneration, d.State == tracker.ResourceFailed, d.failedReason, d.podStatuses, newPodsNames)
 
 				d.AddedPod <- PodAddedReport{
 					ReplicaSetPod: replicaset.ReplicaSetPod{
@@ -307,7 +317,7 @@ func (d *Tracker) Track(ctx context.Context) (err error) {
 				if err != nil {
 					return err
 				}
-				status := NewDeploymentStatus(d.lastObject, d.StatusGeneration, (d.State == tracker.ResourceFailed), d.failedReason, d.podStatuses, newPodsNames)
+				status := NewDeploymentStatus(d.lastObject, d.StatusGeneration, d.State == tracker.ResourceFailed, d.failedReason, d.podStatuses, newPodsNames)
 
 				for podName, containerError := range podContainerErrors {
 					rsName, hasKey := d.rsNameByPod[podName]
@@ -358,7 +368,7 @@ func (d *Tracker) Track(ctx context.Context) (err error) {
 func (d *Tracker) getNewPodsNames() ([]string, error) {
 	res := []string{}
 
-	for podName, _ := range d.podStatuses {
+	for podName := range d.podStatuses {
 		if rsName, hasKey := d.rsNameByPod[podName]; hasKey {
 			if d.lastObject != nil {
 				rsNew, err := utils.IsReplicaSetNew(d.lastObject, d.knownReplicaSets, rsName)
@@ -449,11 +459,13 @@ func (d *Tracker) runPodsInformer(ctx context.Context, object *appsv1.Deployment
 }
 
 func (d *Tracker) runPodTracker(_ctx context.Context, podName, rsName string) error {
-	errorChan := make(chan error, 0)
-	doneChan := make(chan struct{}, 0)
+	errorChan := make(chan error)
+	doneChan := make(chan struct{})
 
 	newCtx, cancelPodCtx := context.WithCancel(_ctx)
-	podTracker := pod.NewTracker(podName, d.Namespace, d.Kube)
+	podTracker := pod.NewTracker(podName, d.Namespace, d.Kube, pod.Options{
+		IgnoreReadinessProbeFailsByContainerName: d.ignoreReadinessProbeFailsByContainerName,
+	})
 	if !d.LogsFromTime.IsZero() {
 		podTracker.LogsFromTime = d.LogsFromTime
 	}
@@ -526,7 +538,7 @@ func (d *Tracker) handleDeploymentState(ctx context.Context, object *appsv1.Depl
 	if err != nil {
 		return err
 	}
-	status := NewDeploymentStatus(object, d.StatusGeneration, (d.State == tracker.ResourceFailed), d.failedReason, d.podStatuses, newPodsNames)
+	status := NewDeploymentStatus(object, d.StatusGeneration, d.State == tracker.ResourceFailed, d.failedReason, d.podStatuses, newPodsNames)
 
 	switch d.State {
 	case tracker.Initial:
@@ -537,36 +549,39 @@ func (d *Tracker) handleDeploymentState(ctx context.Context, object *appsv1.Depl
 			d.runEventsInformer(ctx, object)
 		}
 
-		if status.IsFailed {
+		switch {
+		case status.IsFailed:
 			d.State = tracker.ResourceFailed
 			d.Failed <- status
-		} else if status.IsReady {
+		case status.IsReady:
 			d.State = tracker.ResourceReady
 			d.Ready <- status
-		} else {
+		default:
 			d.State = tracker.ResourceAdded
 			d.Added <- status
 		}
 	case tracker.ResourceAdded, tracker.ResourceFailed:
-		if status.IsFailed {
+		switch {
+		case status.IsFailed:
 			d.State = tracker.ResourceFailed
 			d.Failed <- status
-		} else if status.IsReady {
+		case status.IsReady:
 			d.State = tracker.ResourceReady
 			d.Ready <- status
-		} else {
+		default:
 			d.Status <- status
 		}
 	case tracker.ResourceSucceeded:
 		d.Status <- status
 	case tracker.ResourceDeleted:
-		if status.IsFailed {
+		switch {
+		case status.IsFailed:
 			d.State = tracker.ResourceFailed
 			d.Failed <- status
-		} else if status.IsReady {
+		case status.IsReady:
 			d.State = tracker.ResourceReady
 			d.Ready <- status
-		} else {
+		default:
 			d.State = tracker.ResourceAdded
 			d.Added <- status
 		}
