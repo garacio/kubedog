@@ -60,14 +60,14 @@ func (mt *multitracker) TrackPod(kube kubernetes.Interface, spec MultitrackSpec,
 	//
 	//	return mt.podPodLogChunk(spec, feed, podChunk)
 	//})
-	//feed.OnContainerError(func(ContainerError pod.ContainerError) error {
-	//	mt.mux.Lock()
-	//	defer mt.mux.Unlock()
-	//
-	//	mt.PodsStatuses[spec.ResourceName] = feed.GetStatus()
-	//
-	//	return mt.podContainerError(spec, feed, ContainerError)
-	//})
+	feed.OnContainerError(func(ContainerError pod.ContainerError) error {
+		mt.mux.Lock()
+		defer mt.mux.Unlock()
+
+		mt.PodsStatuses[spec.ResourceName] = feed.GetStatus()
+
+		return mt.podContainerError(spec, feed, ContainerError)
+	})
 	feed.OnStatus(func(status pod.PodStatus) error {
 		mt.mux.Lock()
 		defer mt.mux.Unlock()
@@ -97,6 +97,11 @@ func (mt *multitracker) podFailed(spec MultitrackSpec, feed pod.Feed, reason str
 	return mt.handleResourceFailure(mt.TrackingPods, "pod", spec, reason)
 }
 
+func (mt *multitracker) podCrashLoopBackOff(spec MultitrackSpec, feed pod.Feed, reason string) error {
+	mt.displayResourceErrorF("pod", spec, "%s", reason)
+	return mt.handleResourceFailure(mt.TrackingPods, "pod", spec, reason)
+}
+
 func (mt *multitracker) podReady(spec MultitrackSpec, feed pod.Feed) error {
 	mt.displayResourceTrackerMessageF("pod", spec, "ready")
 
@@ -115,6 +120,14 @@ func (mt *multitracker) podPodLogChunk(spec MultitrackSpec, feed pod.Feed, chunk
 
 func (mt *multitracker) podPodError(spec MultitrackSpec, feed pod.Feed, podError pod.PodError) error {
 	reason := fmt.Sprintf("po/%s container/%s: %s", podError.PodName, podError.ContainerName, podError.Message)
+
+	mt.displayResourceErrorF("pod", spec, "%s", reason)
+
+	return mt.handleResourceFailure(mt.TrackingPods, "pod", spec, reason)
+}
+
+func (mt *multitracker) podContainerError(spec MultitrackSpec, feed pod.Feed, containerError pod.ContainerError) error {
+	reason := fmt.Sprintf("pod/%s: %s", containerError.ContainerName, containerError.Message)
 
 	mt.displayResourceErrorF("pod", spec, "%s", reason)
 
